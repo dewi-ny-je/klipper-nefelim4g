@@ -234,6 +234,7 @@ class TMCStallguardDump:
         self.fields = self.mcu_tmc.get_fields()
         self.sg2_supp = False
         self.sg4_reg_name = None
+        self.batch_bulk = None
         # It is possible to support TMC2660, just disable it for now
         if not self.fields.all_fields.get("DRV_STATUS", None):
             return
@@ -248,7 +249,7 @@ class TMCStallguardDump:
             if self.mcu_tmc.name_to_reg.get("SG4_RESULT", 0):
                 self.sg4_reg_name = "SG4_RESULT"
         # TMC2208
-        if self.sg2_supp is None and self.sg4_reg_name is None:
+        if not self.sg2_supp and self.sg4_reg_name is None:
             return
         self.optimized_spi = False
         # Bulk API
@@ -260,6 +261,8 @@ class TMCStallguardDump:
         api_resp = {'header': ('time', 'sg_result', 'cs_actual')}
         self.batch_bulk.add_mux_endpoint("tmc/stallguard_dump", "name",
                                          self.stepper_name, api_resp)
+    def can_record_sg2(self):
+        return self.sg2_supp and self.batch_bulk is not None
     def _start(self):
         self.error = None
         status = self.mcu_tmc.get_register_raw("DRV_STATUS")
@@ -358,9 +361,11 @@ class TMCCommandHelper:
         gcode.register_mux_command("SET_TMC_CURRENT", "STEPPER", self.name,
                                    self.cmd_SET_TMC_CURRENT,
                                    desc=self.cmd_SET_TMC_CURRENT_help)
-        # Enable only for Stallguard2 drivers
-        fields = self.mcu_tmc.get_fields()
-        if fields.lookup_register("sgt", None) is None:
+        # StallGuard2 calibration needs an SGT field and a readable
+        # sg_result (TMC2660 has the former but no DRV_STATUS register)
+        if self.fields.lookup_register("sgt", None) is None:
+            return
+        if not self.record_helper.can_record_sg2():
             return
         gcode.register_mux_command("TMC_CALIBRATE", "STEPPER", self.name,
                                    self.cmd_TMC_CALIBRATE,
