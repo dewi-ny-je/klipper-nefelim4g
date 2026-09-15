@@ -367,6 +367,12 @@ class TMCCommandHelper:
             return
         if not self.record_helper.can_record_sg2():
             return
+        sconfig = config.getsection(self.stepper_name)
+        self.full_steps_per_rotation = sconfig.getint(
+            'full_steps_per_rotation', 200, minval=1)
+        endstop_pin = sconfig.get('endstop_pin', None, note_valid=False)
+        self.has_virtual_endstop = (endstop_pin is not None
+                                    and 'virtual_endstop' in endstop_pin)
         gcode.register_mux_command("TMC_CALIBRATE", "STEPPER", self.name,
                                    self.cmd_TMC_CALIBRATE,
                                    desc=self.cmd_TMC_CALIBRATE_help)
@@ -565,80 +571,140 @@ class TMCCommandHelper:
                 if self.read_translate is not None:
                     reg_name, val = self.read_translate(reg_name, val)
                 gcmd.respond_info(self.fields.pretty_format(reg_name, val))
-    cmd_TMC_CALIBRATE_help = "Calibrate TMC parameters"
+    cmd_TMC_CALIBRATE_help = "Calibrate TMC StallGuard2 parameters"
     def cmd_TMC_CALIBRATE(self, gcmd):
         target = gcmd.get('TARGET')
-        if target == "sgt" or target == "sgt_velocity":
-            calibrator = TMCStallGuardHelper(self, gcmd)
-            calibrator.start()
-        else:
-            raise gcmd.error("Unknown target name '%s'" % (target))
+        if target not in ("sgt", "sgt_velocity", "verify"):
+            raise gcmd.error("Unknown target name '%s'" % (target,))
+        TMCStallGuardHelper(self, gcmd).start(gcmd)
+
 
 ######################################################################
-# TMC Calibration helpers
+# StallGuard2 calibration
 ######################################################################
+
+SGT_MIN, SGT_MAX = -64, 63
+# Motor shaft speed window for the TARGET=sgt search
+SGT_SEARCH_MIN_RPM, SGT_SEARCH_MAX_RPM = 2., 10.
+# A decision is taken over three electrical periods of motor travel
+SG_WINDOW_FULLSTEPS = 12
+# sg_result only reflects a register change after the next electrical
+# period (four full steps) has been driven
+SG_SETTLE_FULLSTEPS = 4
 
 class TMCStallGuardHelper:
-    def __init__(self, tmc_command_helper, gcmd):
-        self.printer = tmc_command_helper.printer
-        self.mcu_tmc = tmc_command_helper.mcu_tmc
-        self.config_name = tmc_command_helper.config_name
-        self.record_helper = tmc_command_helper.record_helper
+    def __init__(self, cmdhelper, gcmd):
+        self.printer = cmdhelper.printer
+        self.reactor = self.printer.get_reactor()
+        self.gcode = self.printer.lookup_object('gcode')
         self.toolhead = self.printer.lookup_object('toolhead')
+        self.mcu_tmc = cmdhelper.mcu_tmc
+        self.fields = self.mcu_tmc.get_fields()
+        self.config_name = cmdhelper.config_name
+        self.stepper_name = cmdhelper.stepper_name
+        self.short_name = cmdhelper.name
+        self.has_virtual_endstop = cmdhelper.has_virtual_endstop
+        self.record_helper = cmdhelper.record_helper
+        self.current_helper = cmdhelper.current_helper
         self.respond_info = gcmd.respond_info
         self.target = gcmd.get('TARGET')
-        if self.target == "sgt_velocity":
-            self.respond_info(
-                "Move motor and slowly increase velocity")
-        # Prepare
-        stepper_name = tmc_command_helper.stepper_name
         fmove = self.printer.lookup_object('force_move')
-        self.mcu_stepper = fmove.lookup_stepper(stepper_name)
-        # Max speed is 10 RPM
-        _, steps_per_rotation = self.mcu_stepper.get_rotation_distance()
-        max_rpm = 10
-        min_rpm = 2
-        if self.target == "sgt":
-            self.respond_info(
-                "Move stepper/toolhead at %d RPM < low velocity < %d RPM" % (
-                    min_rpm, max_rpm))
-        # Steps per second limits
-        self.fullstep_window = steps_per_rotation / 200
-        self.max_sps = steps_per_rotation * (max_rpm / 60)
-        self.min_sps = steps_per_rotation * (min_rpm / 60)
-        # Registers state
-        self.fields = self.mcu_tmc.get_fields()
+        self.mcu_stepper = fmove.lookup_stepper(self.stepper_name)
+        self.mcu = self.mcu_stepper.get_mcu()
+        self.step_dist = self.mcu_stepper.get_step_dist()
+        # Travel is measured in motor microsteps.  StallGuard follows the
+        # motor's electrical period, so gear_ratio and
+        # full_steps_per_rotation must not leak in: get_rotation_distance()
+        # counts steps per *output* rotation and is off by both.
+        microsteps = 256 >> self.fields.get_field("mres")
+        full_steps = cmdhelper.full_steps_per_rotation
+        self.window_steps = SG_WINDOW_FULLSTEPS * microsteps
+        self.settle_steps = SG_SETTLE_FULLSTEPS * microsteps
+        steps_per_rev = full_steps * microsteps
+        self.min_sps = steps_per_rev * SGT_SEARCH_MIN_RPM / 60.
+        self.max_sps = steps_per_rev * SGT_SEARCH_MAX_RPM / 60.
+        self.min_sg = gcmd.get_int('MIN_SG', 16, minval=1)
+        # Samples are (print_time, mcu_position, sg_result)
+        self.msgs = []
+        self.samples = []
+        self.settle_pos = None
+        self.is_running = False
+        self._timer = None
+        self.last_notice = 0.
+        self.max_sg = 0
+        # Register save/restore
         self._dirty_regs = collections.OrderedDict()
         self._prev_state = collections.OrderedDict()
-        # Measurements
-        self.reactor = self.printer.get_reactor()
-        self.msgs = []
-        self.is_running = True
-        self._timer = None
+        # TARGET=sgt search state
         self.sgt = 0
-        self.respond_info("Use ABORT to exit")
-        gcode = self.printer.lookup_object("gcode")
+        self.positive_at = None
+    def start(self, gcmd):
+        # On TMC2240 a non-zero driver_SG4_THRS makes sensorless homing
+        # use StallGuard4 and ignore driver_SGT entirely
+        if self.fields.lookup_register("sg4_thrs", None) is not None:
+            if self.fields.get_field("sg4_thrs"):
+                self.respond_info(
+                    "Warning: driver_SG4_THRS is set - sensorless homing"
+                    " uses StallGuard4 and ignores driver_SGT")
+        if self.target == "verify":
+            self._run_verify(gcmd)
+            return
+        self.toolhead.wait_moves()
+        # Interactive targets hold the global ABORT command while they
+        # run, the same way manual_probe and bed_screws do, which also
+        # keeps two calibrations from running at once
         try:
-            gcode.register_command("ABORT", self._cmd_abort,
-                                   desc=self._cmd_abort_help)
+            self.gcode.register_command("ABORT", self.cmd_ABORT,
+                                        desc=self.cmd_ABORT_help)
         except self.printer.config_error:
             raise gcmd.error("Another calibration in progress")
-    _cmd_abort_help = "Abort stallguard calibration"
-    def _cmd_abort(self, gcmd):
+        self.is_running = True
+        # StallGuard2 needs SpreadCycle and CoolStep off (AN-002 section
+        # 2: SEMIN=0 while parameterizing), and no high velocity mode.
+        # The user's sfilt is left alone: the threshold has to be found
+        # under the filter setting homing will run with, and AN-002 2.2
+        # recommends filtering off for stall detection.
+        if self.fields.lookup_register("en_pwm_mode", None) is not None:
+            self._set_field("en_pwm_mode", 0)
+        if self.fields.lookup_register("semin", None) is not None:
+            self._set_field("semin", 0)
+        if self.fields.lookup_register("thigh", None) is not None:
+            self._set_field("thigh", 0)
+        if self.target == "sgt":
+            self._set_field("sgt", self.sgt)
+        self._send_fields()
+        self._mark_settle()
+        if self.target == "sgt":
+            self.respond_info(
+                "Move the stepper/toolhead by hand or with FORCE_MOVE at a"
+                " steady %.1f - %.1f mm/s (%d - %d motor RPM)\n"
+                "driver_SGT is raised until sg_result leaves zero, then the"
+                " boundary is confirmed from above" % (
+                    self.min_sps * self.step_dist,
+                    self.max_sps * self.step_dist,
+                    SGT_SEARCH_MIN_RPM, SGT_SEARCH_MAX_RPM))
+        else:
+            self.respond_info(
+                "Move the stepper/toolhead, slowly increasing the velocity"
+                " (driver_SGT=%d, looking for sg_result >= %d)" % (
+                    self.fields.get_field("sgt"), self.min_sg))
+        self.respond_info("Use ABORT to exit")
+        self.record_helper.batch_bulk.add_client(self.handle_batch)
+        self._timer = self.reactor.register_timer(self._event,
+                                                  self.reactor.NOW)
+    cmd_ABORT_help = "Abort StallGuard calibration"
+    def cmd_ABORT(self, gcmd):
+        self._finish()
+        gcmd.respond_info("StallGuard calibration aborted")
+    def _finish(self):
         self.is_running = False
-        gcode = self.printer.lookup_object("gcode")
-        gcode.register_command("ABORT", None)
+        self.gcode.register_command("ABORT", None)
         if self._timer is not None:
             self.reactor.unregister_timer(self._timer)
             self._timer = None
         self.toolhead.wait_moves()
         self._restore_fields()
-    def handle_batch(self, msg):
-        self.msgs.append(msg)
-        return self.is_running
-    def _set_runtime_field(self, field_name, value):
-        reg_name = self.fields.lookup_register(field_name)
-        self._dirty_regs[reg_name] = self.fields.set_field(field_name, value)
+    # Register helpers
     def _set_field(self, field_name, value):
         self._prev_state[field_name] = self.fields.get_field(field_name)
         reg_name = self.fields.lookup_register(field_name)
@@ -652,112 +718,265 @@ class TMCStallGuardHelper:
             self._set_field(field, val)
         self._send_fields()
         self._prev_state.clear()
-    def start(self):
-        self.toolhead.wait_moves()
-        # On earlier drivers, "stealthchop" must be disabled
-        self._set_field("en_pwm_mode", 0)
-        # Enable stallguard filtering
-        self._set_field("sfilt", 1)
-        if self.target == "sgt":
-            self._set_field("sgt", self.sgt)
-        # Disable thigh
-        reg = self.fields.lookup_register("thigh", None)
-        if reg is not None:
-            self._set_field("thigh", 0)
+    def _set_sgt(self, sgt):
+        self.sgt = sgt
+        reg_name = self.fields.lookup_register("sgt")
+        self._dirty_regs[reg_name] = self.fields.set_field("sgt", sgt)
         self._send_fields()
-        # Start recording
-        self.record_helper.batch_bulk.add_client(self.handle_batch)
-        # Run handler
-        self._timer = self.reactor.register_timer(self._event, self.reactor.NOW)
-    def _stepper_sps(self, ptime, tdiff):
-        pos_now = self.mcu_stepper.get_past_mcu_position(ptime)
-        pos_prev = self.mcu_stepper.get_past_mcu_position(ptime - tdiff)
-        avg_sps = abs(pos_now - pos_prev) / tdiff
-        return int(avg_sps)
-    def _event(self, eventtime):
-        pairs = []
-        tdiff = 0.004
+        self._mark_settle()
+        self.respond_info("Testing driver_SGT=%d" % (sgt,))
+    def _mark_settle(self):
+        # Ignore readings until the motor has moved one electrical period
+        # past the register write
+        now = self.mcu.estimated_print_time(self.reactor.monotonic())
+        self.settle_pos = self.mcu_stepper.get_past_mcu_position(now)
+        self.samples = []
+    # Sample handling
+    def handle_batch(self, msg):
+        self.msgs.append(msg)
+        return self.is_running
+    def _ingest(self):
+        new = []
         while self.msgs:
-            msg = self.msgs.pop(0)
-            samples = msg["data"]
-            for ptime, sg, _ in samples:
-                sps = self._stepper_sps(ptime, tdiff)
-                pairs.append((ptime, sps, sg))
-        if len(pairs) == 0:
-            return eventtime + 1.0
+            for ptime, sg, _ in self.msgs.pop(0)["data"]:
+                if sg < 0:
+                    # TMCStallguardDump could not decode a result
+                    return None
+                pos = self.mcu_stepper.get_past_mcu_position(ptime)
+                new.append((ptime, pos, sg))
+        return new
+    def _notice(self, msg):
+        now = self.reactor.monotonic()
+        if now - self.last_notice < 5.:
+            return
+        self.last_notice = now
+        self.respond_info(msg)
+    def _event(self, eventtime):
+        new = self._ingest()
+        if new is None:
+            self.respond_info("Unable to read sg_result from driver"
+                              " - aborting")
+            self._finish()
+            return self.reactor.NEVER
+        if self.settle_pos is not None:
+            new = [s for s in new
+                   if abs(s[1] - self.settle_pos) >= self.settle_steps]
+            if new:
+                self.settle_pos = None
+        if new:
+            self.max_sg = max(self.max_sg, max([sg for _, _, sg in new]))
+            self.samples.extend(new)
+            # Keep enough history for a window at the slowest speed
+            keep = 2. * self.window_steps / self.min_sps
+            cutoff = self.samples[-1][0] - keep
+            self.samples = [s for s in self.samples if s[0] >= cutoff]
         if self.target == "sgt":
-            return self._sgt_calibration_event(eventtime, pairs)
-        return self._sgt_velocity_event(eventtime, pairs)
-    def _filter_stable_window(self, pairs, width=5):
-        wsize = self.fullstep_window * width
-        for L in range(0, len(pairs) - 1):
-            ptime, sps, _ = pairs[L]
-            if sps == 0:
-                continue
-            twindow = wsize / sps
-            ptime_end = ptime + twindow
-            R = L + 1
-            while R < len(pairs) and pairs[R][0] <= ptime_end:
+            done = self._sgt_step()
+        else:
+            done = self._velocity_step()
+        if done:
+            self._finish()
+            return self.reactor.NEVER
+        return eventtime + 0.5
+    def _find_window(self, accept, max_sps=None):
+        # Return the oldest run of samples spanning window_steps of travel
+        # at an acceptable speed for which accept() holds, as (W, sps)
+        samples = self.samples
+        n = len(samples)
+        R = 1
+        for L in range(n):
+            t0, p0, _ = samples[L]
+            if R <= L:
+                R = L + 1
+            while R < n and abs(samples[R][1] - p0) < self.window_steps:
                 R += 1
-            W = pairs[L:R+1]
-            # Not enough samples
-            if W[-1][0] - W[0][0] < twindow:
-                break
-            sps_is_ok = all([sps > self.min_sps for _, sps, _ in W])
-            if not sps_is_ok:
+            if R >= n:
+                # Not enough travel recorded past this point yet
+                return None
+            t1, p1, _ = samples[R]
+            if t1 <= t0:
                 continue
-            sg_is_zero = all([sg == 0 for _, _, sg in W])
-            sg_is_positive = all([sg > 0 for _, _, sg in W])
-            if sg_is_zero != sg_is_positive:
-                return W
-        return []
-    def _sgt_calibration_event(self, eventtime, pairs):
-        max_sps = max([sps for _, sps, _ in pairs])
-        if max_sps > self.max_sps:
-            step_dist = self.mcu_stepper.get_step_dist()
-            self.respond_info(
-                "Stepper velocity too high: %.1f > %.1f mm/s" % (
-                    max_sps * step_dist, self.max_sps * step_dist))
-            return eventtime + 1.0
-        W = self._filter_stable_window(pairs)
-        if len(W) == 0:
-            return eventtime + 1.0
-        sg_is_zero = all([sg == 0 for _, _, sg in W])
-        results = [sg for _, _, sg in W]
-        avg_result = sum(results) / len(results)
-        if sg_is_zero:
-            self.sgt += 1
-            self._set_runtime_field("sgt", self.sgt)
-            self._send_fields()
-            self.msgs = []
-            self.respond_info("Test sgt: %d" % (self.sgt))
-            return eventtime + 1.0
-        # Finish
-        self.respond_info("Avg sg_result: %.1f" % (avg_result))
-        self.sgt -= 1
+            sps = abs(p1 - p0) / (t1 - t0)
+            if sps < self.min_sps:
+                continue
+            if max_sps is not None and sps > max_sps:
+                self._notice("Too fast: %.1f mm/s, stay below %.1f mm/s" % (
+                    sps * self.step_dist, max_sps * self.step_dist))
+                continue
+            W = samples[L:R+1]
+            if accept(W):
+                return W, sps
+        return None
+    # TARGET=sgt: find the highest SGT that still reads zero at low speed
+    def _sgt_step(self):
+        def decisive(W):
+            sgs = [sg for _, _, sg in W]
+            return min(sgs) > 0 or max(sgs) == 0
+        found = self._find_window(decisive, self.max_sps)
+        if found is None:
+            return False
+        W, sps = found
+        if min([sg for _, _, sg in W]) > 0:
+            self.positive_at = self.sgt
+            if self.sgt <= SGT_MIN:
+                self.respond_info("sg_result stays positive down to SGT %d"
+                                  " - motor too fast?" % (SGT_MIN,))
+                return True
+            self._set_sgt(self.sgt - 1)
+            return False
+        # The window read zero throughout
+        if self.positive_at == self.sgt + 1:
+            self._finish_sgt(sps)
+            return True
+        if self.sgt >= SGT_MAX:
+            self.respond_info("sg_result stays zero up to SGT %d"
+                              " - motor too slow or overloaded?" % (SGT_MAX,))
+            return True
+        self._set_sgt(self.sgt + 1)
+        return False
+    def _finish_sgt(self, sps):
+        run_current = self.current_helper.get_current()[0]
         configfile = self.printer.lookup_object('configfile')
-        configfile.set(self.config_name, 'driver_SGT',
-                       self.sgt)
-        self.respond_info("driver_SGT: %d" % (self.sgt))
+        configfile.set(self.config_name, 'driver_SGT', self.sgt)
+        self.respond_info(
+            "driver_SGT: %d (sg_result zero at %.1f mm/s, positive at %d)\n"
+            "Measured with run_current %.3fA and sfilt=%d; SGT only holds"
+            " near the operating point it was found at (AN-002 2.5.1)\n"
+            "Next: SAVE_CONFIG, then TMC_CALIBRATE STEPPER=%s"
+            " TARGET=sgt_velocity and TARGET=verify" % (
+                self.sgt, sps * self.step_dist, self.positive_at,
+                run_current, self.fields.get_field("sfilt"),
+                self.short_name))
         self.respond_info(
             "The SAVE_CONFIG command will update the printer config file\n"
             "with these parameters and restart the printer.")
-        self._cmd_abort(None)
-        return self.reactor.NEVER
-    def _sgt_velocity_event(self, eventtime, pairs):
-        W = self._filter_stable_window(pairs)
-        sg_is_zero = all([sg == 0 for _, _, sg in W])
-        if sg_is_zero:
-            return eventtime + 1.0
-        min_sps = min([sps for _, sps, _ in W])
-        min_sg = min([sg for _, _, sg in W])
-        step_dist = self.mcu_stepper.get_step_dist()
-        min_vel = min_sps * step_dist
-        self.respond_info("Stall detection velocity must be above %.1f mm/s" % (
-                          min_vel))
-        self.respond_info("Min sg_result: %.1f" % (min_sg))
-        self._cmd_abort(None)
-        return self.reactor.NEVER
+    # TARGET=sgt_velocity: lowest speed at which sg_result is usable
+    def _velocity_step(self):
+        min_sg = self.min_sg
+        def usable(W):
+            return min([sg for _, _, sg in W]) >= min_sg
+        found = self._find_window(usable)
+        if found is None:
+            return False
+        W, sps = found
+        vel = sps * self.step_dist
+        lowest = min([sg for _, _, sg in W])
+        self.respond_info(
+            "sg_result stays >= %d from %.1f mm/s (lowest %d, peak seen %d)"
+            % (self.min_sg, vel, lowest, self.max_sg))
+        if self.fields.lookup_register("tcoolthrs", None) is None:
+            return True
+        # AN-002 2.1: the stall velocity gate should sit close to the
+        # working velocity, because back-EMF changes quickly during
+        # acceleration and can trip StallGuard early.  Without a
+        # coolstep_threshold, Klipper arms the DIAG output for the whole
+        # homing ramp.
+        configfile = self.printer.lookup_object('configfile')
+        configfile.set(self.config_name, 'coolstep_threshold', "%.1f" % (vel,))
+        self.respond_info(
+            "coolstep_threshold: %.1f mm/s - stall detection is armed only"
+            " above this speed; home faster than it" % (vel,))
+        self.respond_info(
+            "The SAVE_CONFIG command will update the printer config file\n"
+            "with these parameters and restart the printer.")
+        return True
+    # TARGET=verify: record sg_result through a real sensorless home
+    def _default_axis(self):
+        kin = self.toolhead.get_kinematics()
+        rails = getattr(kin, 'rails', None)
+        if not rails:
+            return None
+        for i, rail in enumerate(rails[:3]):
+            names = [s.get_name() for s in rail.get_steppers()]
+            if self.stepper_name in names:
+                return "xyz"[i]
+        return None
+    def _run_verify(self, gcmd):
+        if not self.has_virtual_endstop:
+            raise gcmd.error("%s does not home with a tmc virtual_endstop"
+                             % (self.stepper_name,))
+        axis = gcmd.get('AXIS', self._default_axis())
+        if axis is None:
+            raise gcmd.error("Unable to determine the homing axis of %s"
+                             " - specify AXIS=" % (self.stepper_name,))
+        self.toolhead.wait_moves()
+        self.is_running = True
+        self.record_helper.batch_bulk.add_client(self.handle_batch)
+        try:
+            self.gcode.run_script_from_command("G28 %s" % (axis.upper(),))
+        finally:
+            self.toolhead.wait_moves()
+            # Let the last batch arrive before dropping the client
+            self.reactor.pause(self.reactor.monotonic()
+                               + 2. * bulk_sensor.BATCH_INTERVAL)
+            self.is_running = False
+        samples = self._ingest()
+        if samples is None:
+            raise gcmd.error("Unable to read sg_result from driver")
+        self._report_verify(samples)
+    def _report_verify(self, samples):
+        # Split the recording into moves (runs of samples with steps)
+        moves = []
+        cur = []
+        for ptime, pos, sg in samples:
+            if pos != self.mcu_stepper.get_past_mcu_position(ptime - 0.02):
+                cur.append((ptime, pos, sg))
+            elif cur:
+                moves.append(cur)
+                cur = []
+        if cur:
+            moves.append(cur)
+        min_travel = 2 * self.settle_steps + self.window_steps
+        count = 0
+        for m in moves:
+            p0, pn = m[0][1], m[-1][1]
+            travel = abs(pn - p0)
+            if travel < min_travel:
+                continue
+            count += 1
+            vel = travel / (m[-1][0] - m[0][0]) * self.step_dist
+            # Cruise excludes the ramp-in and the final period, where a
+            # stall collapses sg_result by design
+            cruise = sorted([sg for _, pos, sg in m
+                             if abs(pos - p0) >= self.settle_steps
+                             and abs(pn - pos) >= self.settle_steps])
+            final = [sg for _, pos, sg in m
+                     if abs(pn - pos) < self.settle_steps]
+            plateau = cruise[len(cruise) // 2]
+            cruise_min = cruise[0]
+            end_min = min(final)
+            self.respond_info(
+                "Move %d: %.1f mm/s, sg_result plateau %d, cruise minimum"
+                " %d, end %d%s" % (count, vel, plateau, cruise_min, end_min,
+                                  " (stall)" if end_min == 0 else ""))
+            if end_min != 0:
+                continue
+            # AN-002 2.2: the lowest reading preceding the stall is the
+            # safety margin against false stall detection
+            if plateau < 50:
+                self.respond_info(
+                    "  Unloaded sg_result is only %d at %.1f mm/s: little"
+                    " headroom, raise driver_SGT or the homing speed"
+                    % (plateau, vel))
+            elif cruise_min * 5 < plateau:
+                self.respond_info(
+                    "  sg_result dipped to %d%% of the plateau during travel"
+                    " (resonance or a tight spot): close to a false stall"
+                    % (100 * cruise_min // plateau,))
+            else:
+                self.respond_info(
+                    "  Lowest reading before the stall keeps %d%% of the"
+                    " plateau" % (100 * cruise_min // plateau,))
+        if not count:
+            self.respond_info("No homing move long enough to evaluate"
+                              " was recorded")
+        if self.fields.lookup_register("tcoolthrs", None) is not None:
+            if not self.fields.get_field("tcoolthrs"):
+                self.respond_info(
+                    "coolstep_threshold is not set: stall detection was"
+                    " armed during the whole acceleration ramp. Run"
+                    " TARGET=sgt_velocity to set it (AN-002 2.1)")
+
 
 ######################################################################
 # TMC virtual pins
