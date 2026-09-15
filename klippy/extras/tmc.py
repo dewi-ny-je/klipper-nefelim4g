@@ -234,6 +234,7 @@ class TMCStallguardDump:
         self.fields = self.mcu_tmc.get_fields()
         self.sg2_supp = False
         self.sg4_reg_name = None
+        self.batch_bulk = None
         # It is possible to support TMC2660, just disable it for now
         if not self.fields.all_fields.get("DRV_STATUS", None):
             return
@@ -248,7 +249,7 @@ class TMCStallguardDump:
             if self.mcu_tmc.name_to_reg.get("SG4_RESULT", 0):
                 self.sg4_reg_name = "SG4_RESULT"
         # TMC2208
-        if self.sg2_supp is None and self.sg4_reg_name is None:
+        if not self.sg2_supp and self.sg4_reg_name is None:
             return
         self.optimized_spi = False
         # Bulk API
@@ -260,6 +261,9 @@ class TMCStallguardDump:
         api_resp = {'header': ('time', 'sg_result', 'cs_actual')}
         self.batch_bulk.add_mux_endpoint("tmc/stallguard_dump", "name",
                                          self.stepper_name, api_resp)
+    def is_sg2_capable(self):
+        # StallGuard2 (sg_result in DRV_STATUS) is available for recording
+        return self.sg2_supp and self.batch_bulk is not None
     def _start(self):
         self.error = None
         status = self.mcu_tmc.get_register_raw("DRV_STATUS")
@@ -358,10 +362,16 @@ class TMCCommandHelper:
         gcode.register_mux_command("SET_TMC_CURRENT", "STEPPER", self.name,
                                    self.cmd_SET_TMC_CURRENT,
                                    desc=self.cmd_SET_TMC_CURRENT_help)
-        # Enable only for Stallguard2 drivers
-        fields = self.mcu_tmc.get_fields()
-        if fields.lookup_register("sgt", None) is None:
+        # Enable only for StallGuard2 drivers that can also record
+        # sg_result - TMC2660 has "sgt" but no DRV_STATUS register, so
+        # TMCStallguardDump has nothing to stream from
+        if self.fields.lookup_register("sgt", None) is None:
             return
+        if not self.record_helper.is_sg2_capable():
+            return
+        sconfig = config.getsection(self.stepper_name)
+        self.full_steps_per_rotation = sconfig.getint(
+            'full_steps_per_rotation', 200, minval=1)
         gcode.register_mux_command("TMC_CALIBRATE", "STEPPER", self.name,
                                    self.cmd_TMC_CALIBRATE,
                                    desc=self.cmd_TMC_CALIBRATE_help)
@@ -589,32 +599,38 @@ class TMCStallGuardHelper:
         stepper_name = tmc_command_helper.stepper_name
         fmove = self.printer.lookup_object('force_move')
         self.mcu_stepper = fmove.lookup_stepper(stepper_name)
-        # Max speed is 10 RPM
-        _, steps_per_rotation = self.mcu_stepper.get_rotation_distance()
+        # Registers state
+        self.fields = self.mcu_tmc.get_fields()
+        self._dirty_regs = collections.OrderedDict()
+        self._prev_state = collections.OrderedDict()
+        # StallGuard follows the motor electrical period, so the limits
+        # below must be in motor microsteps.  The driver "mres" field and
+        # full_steps_per_rotation give that directly, while
+        # get_rotation_distance() reports steps per *output* rotation - it
+        # is off by gear_ratio, and by 2x on 0.9 degree motors.
+        microsteps = 256 >> self.fields.get_field("mres")
+        full_steps = tmc_command_helper.full_steps_per_rotation
         max_rpm = 10
         min_rpm = 2
         if self.target == "sgt":
             self.respond_info(
                 "Move stepper/toolhead at %d RPM < low velocity < %d RPM" % (
                     min_rpm, max_rpm))
-        # Steps per second limits
-        self.fullstep_window = steps_per_rotation / 200
-        self.max_sps = steps_per_rotation * (max_rpm / 60)
-        self.min_sps = steps_per_rotation * (min_rpm / 60)
-        # Registers state
-        self.fields = self.mcu_tmc.get_fields()
-        self._dirty_regs = collections.OrderedDict()
-        self._prev_state = collections.OrderedDict()
+        # Steps per second limits (motor shaft)
+        self.fullstep_window = microsteps
+        steps_per_motor_rotation = full_steps * microsteps
+        self.max_sps = steps_per_motor_rotation * (max_rpm / 60.)
+        self.min_sps = steps_per_motor_rotation * (min_rpm / 60.)
         # Measurements
         self.reactor = self.printer.get_reactor()
         self.msgs = []
         self.is_running = True
         self._timer = None
         self.sgt = 0
-        self.respond_info("Use ABORT to exit")
+        self.respond_info("Use ABORT_TMC_CALIBRATE to exit")
         gcode = self.printer.lookup_object("gcode")
         try:
-            gcode.register_command("ABORT", self._cmd_abort,
+            gcode.register_command("ABORT_TMC_CALIBRATE", self._cmd_abort,
                                    desc=self._cmd_abort_help)
         except self.printer.config_error:
             raise gcmd.error("Another calibration in progress")
@@ -622,7 +638,7 @@ class TMCStallGuardHelper:
     def _cmd_abort(self, gcmd):
         self.is_running = False
         gcode = self.printer.lookup_object("gcode")
-        gcode.register_command("ABORT", None)
+        gcode.register_command("ABORT_TMC_CALIBRATE", None)
         if self._timer is not None:
             self.reactor.unregister_timer(self._timer)
             self._timer = None
@@ -676,6 +692,13 @@ class TMCStallGuardHelper:
             msg = self.msgs.pop(0)
             samples = msg["data"]
             for ptime, sg, _ in samples:
+                if sg < 0:
+                    # TMCStallguardDump could not decode a result - without
+                    # this check the calibration silently never converges
+                    self.respond_info(
+                        "Unable to read sg_result from driver - aborting")
+                    self._cmd_abort(None)
+                    return self.reactor.NEVER
                 sps = self._stepper_sps(ptime, tdiff)
                 pairs.append((ptime, sps, sg))
         if len(pairs) == 0:
@@ -691,19 +714,21 @@ class TMCStallGuardHelper:
                 continue
             twindow = wsize / sps
             ptime_end = ptime + twindow
+            # R is the first sample at or past the end of the window
             R = L + 1
-            while R < len(pairs) and pairs[R][0] <= ptime_end:
+            while R < len(pairs) and pairs[R][0] < ptime_end:
                 R += 1
-            W = pairs[L:R+1]
-            # Not enough samples
-            if W[-1][0] - W[0][0] < twindow:
+            if R >= len(pairs):
+                # No sample past the window yet - it is not covered, and
+                # neither is any later (shorter) start point
                 break
+            W = pairs[L:R]
             sps_is_ok = all([sps > self.min_sps for _, sps, _ in W])
             if not sps_is_ok:
                 continue
             sg_is_zero = all([sg == 0 for _, _, sg in W])
             sg_is_positive = all([sg > 0 for _, _, sg in W])
-            if sg_is_zero != sg_is_positive:
+            if sg_is_zero or sg_is_positive:
                 return W
         return []
     def _sgt_calibration_event(self, eventtime, pairs):
@@ -741,6 +766,8 @@ class TMCStallGuardHelper:
         return self.reactor.NEVER
     def _sgt_velocity_event(self, eventtime, pairs):
         W = self._filter_stable_window(pairs)
+        if len(W) == 0:
+            return eventtime + 1.0
         sg_is_zero = all([sg == 0 for _, _, sg in W])
         if sg_is_zero:
             return eventtime + 1.0
