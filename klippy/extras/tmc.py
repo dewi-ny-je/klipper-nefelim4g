@@ -263,6 +263,8 @@ class TMCStallguardDump:
                                          self.stepper_name, api_resp)
     def can_record_sg2(self):
         return self.sg2_supp and self.batch_bulk is not None
+    def can_record_sg4(self):
+        return self.sg4_reg_name is not None and self.batch_bulk is not None
     def _start(self):
         self.error = None
         status = self.mcu_tmc.get_register_raw("DRV_STATUS")
@@ -362,10 +364,17 @@ class TMCCommandHelper:
                                    self.cmd_SET_TMC_CURRENT,
                                    desc=self.cmd_SET_TMC_CURRENT_help)
         # StallGuard2 calibration needs an SGT field and a readable
-        # sg_result (TMC2660 has the former but no DRV_STATUS register)
-        if self.fields.lookup_register("sgt", None) is None:
-            return
-        if not self.record_helper.can_record_sg2():
+        # sg_result (TMC2660 has the former but no DRV_STATUS register);
+        # StallGuard4 calibration needs its threshold field and SG_RESULT
+        self.has_sg2 = (self.fields.lookup_register("sgt", None) is not None
+                        and self.record_helper.can_record_sg2())
+        self.sg4_thrs_field = None
+        for field in ("sgthrs", "sg4_thrs"):
+            if self.fields.lookup_register(field, None) is not None:
+                self.sg4_thrs_field = field
+        has_sg4 = (self.sg4_thrs_field is not None
+                   and self.record_helper.can_record_sg4())
+        if not self.has_sg2 and not has_sg4:
             return
         sconfig = config.getsection(self.stepper_name)
         self.full_steps_per_rotation = sconfig.getint(
@@ -574,7 +583,7 @@ class TMCCommandHelper:
     cmd_TMC_CALIBRATE_help = "Calibrate TMC StallGuard2 parameters"
     def cmd_TMC_CALIBRATE(self, gcmd):
         target = gcmd.get('TARGET')
-        if target not in ("sgt", "sgt_velocity", "verify"):
+        if target not in ("sgt", "sgthrs", "sgt_velocity", "verify"):
             raise gcmd.error("Unknown target name '%s'" % (target,))
         TMCStallGuardHelper(self, gcmd).start(gcmd)
 
@@ -604,6 +613,12 @@ class TMCStallGuardHelper:
         self.stepper_name = cmdhelper.stepper_name
         self.short_name = cmdhelper.name
         self.has_virtual_endstop = cmdhelper.has_virtual_endstop
+        self.sg4_thrs_field = cmdhelper.sg4_thrs_field
+        # StallGuard4 is what sensorless homing uses when the driver has
+        # no SGT (TMC2209) or when driver_SG4_THRS is set (TMC2240)
+        self.use_sg4 = not cmdhelper.has_sg2 or (
+            self.sg4_thrs_field is not None
+            and self.fields.get_field(self.sg4_thrs_field) != 0)
         self.record_helper = cmdhelper.record_helper
         self.current_helper = cmdhelper.current_helper
         self.respond_info = gcmd.respond_info
@@ -639,15 +654,18 @@ class TMCStallGuardHelper:
         self.sgt = 0
         self.positive_at = None
     def start(self, gcmd):
-        # On TMC2240 a non-zero driver_SG4_THRS makes sensorless homing
-        # use StallGuard4 and ignore driver_SGT entirely
-        if self.fields.lookup_register("sg4_thrs", None) is not None:
-            if self.fields.get_field("sg4_thrs"):
-                self.respond_info(
-                    "Warning: driver_SG4_THRS is set - sensorless homing"
-                    " uses StallGuard4 and ignores driver_SGT")
-        if self.target == "verify":
-            self._run_verify(gcmd)
+        if self.target == "sgt" and self.use_sg4:
+            raise gcmd.error(
+                "%s homes with StallGuard4 (driver_SGT is not used) - use"
+                " TARGET=sgthrs" % (self.stepper_name,))
+        if self.target == "sgthrs" and not self.use_sg4:
+            hint = ""
+            if self.sg4_thrs_field is not None:
+                hint = " (set driver_SG4_THRS to a starting value first)"
+            raise gcmd.error("%s homes with StallGuard2 - use TARGET=sgt%s"
+                             % (self.stepper_name, hint))
+        if self.target in ("sgthrs", "verify"):
+            self._run_homing_capture(gcmd)
             return
         self.toolhead.wait_moves()
         # Interactive targets hold the global ABORT command while they
@@ -659,12 +677,19 @@ class TMCStallGuardHelper:
         except self.printer.config_error:
             raise gcmd.error("Another calibration in progress")
         self.is_running = True
-        # StallGuard2 needs SpreadCycle and CoolStep off (AN-002 section
-        # 2: SEMIN=0 while parameterizing), and no high velocity mode.
-        # The user's sfilt is left alone: the threshold has to be found
-        # under the filter setting homing will run with, and AN-002 2.2
-        # recommends filtering off for stall detection.
-        if self.fields.lookup_register("en_pwm_mode", None) is not None:
+        # StallGuard2 needs SpreadCycle, StallGuard4 needs StealthChop
+        # (AN-002 sections 2 and 3); CoolStep is off while parameterizing
+        # (SEMIN=0) and the high velocity mode is disabled.  The user's
+        # sfilt is left alone: the threshold has to be found under the
+        # filter setting homing will run with, and AN-002 2.2 recommends
+        # filtering off for stall detection.
+        if self.use_sg4:
+            if self.fields.lookup_register("en_pwm_mode", None) is not None:
+                self._set_field("en_pwm_mode", 1)
+            else:
+                self._set_field("en_spreadcycle", 0)
+            self._set_field("tpwmthrs", 0)
+        elif self.fields.lookup_register("en_pwm_mode", None) is not None:
             self._set_field("en_pwm_mode", 0)
         if self.fields.lookup_register("semin", None) is not None:
             self._set_field("semin", 0)
@@ -686,8 +711,7 @@ class TMCStallGuardHelper:
         else:
             self.respond_info(
                 "Move the stepper/toolhead, slowly increasing the velocity"
-                " (driver_SGT=%d, looking for sg_result >= %d)" % (
-                    self.fields.get_field("sgt"), self.min_sg))
+                " (looking for sg_result >= %d)" % (self.min_sg,))
         self.respond_info("Use ABORT to exit")
         self.record_helper.batch_bulk.add_client(self.handle_batch)
         self._timer = self.reactor.register_timer(self._event,
@@ -880,7 +904,8 @@ class TMCStallGuardHelper:
             "The SAVE_CONFIG command will update the printer config file\n"
             "with these parameters and restart the printer.")
         return True
-    # TARGET=verify: record sg_result through a real sensorless home
+    # TARGET=verify / TARGET=sgthrs: record sg_result through a real
+    # sensorless homing move
     def _default_axis(self):
         kin = self.toolhead.get_kinematics()
         rails = getattr(kin, 'rails', None)
@@ -891,10 +916,14 @@ class TMCStallGuardHelper:
             if self.stepper_name in names:
                 return "xyz"[i]
         return None
-    def _run_verify(self, gcmd):
+    def _run_homing_capture(self, gcmd):
         if not self.has_virtual_endstop:
             raise gcmd.error("%s does not home with a tmc virtual_endstop"
                              % (self.stepper_name,))
+        if self.use_sg4 and not self.fields.get_field(self.sg4_thrs_field):
+            raise gcmd.error(
+                "driver_%s is 0, which never triggers - set a starting"
+                " value that homes first" % (self.sg4_thrs_field.upper(),))
         axis = gcmd.get('AXIS', self._default_axis())
         if axis is None:
             raise gcmd.error("Unable to determine the homing axis of %s"
@@ -913,51 +942,77 @@ class TMCStallGuardHelper:
         samples = self._ingest()
         if samples is None:
             raise gcmd.error("Unable to read sg_result from driver")
-        self._report_verify(samples)
-    def _report_verify(self, samples):
+        moves = self._analyze_moves(samples)
+        self._report_moves(moves)
+        if self.target == "sgthrs":
+            self._finish_sgthrs(moves)
+    def _analyze_moves(self, samples):
         # Split the recording into moves (runs of samples with steps)
-        moves = []
+        runs = []
         cur = []
         for ptime, pos, sg in samples:
             if pos != self.mcu_stepper.get_past_mcu_position(ptime - 0.02):
                 cur.append((ptime, pos, sg))
             elif cur:
-                moves.append(cur)
+                runs.append(cur)
                 cur = []
         if cur:
-            moves.append(cur)
+            runs.append(cur)
         min_travel = 2 * self.settle_steps + self.window_steps
-        count = 0
-        for m in moves:
+        moves = []
+        homing_dir = None
+        for m in runs:
             p0, pn = m[0][1], m[-1][1]
-            travel = abs(pn - p0)
-            if travel < min_travel:
+            if abs(pn - p0) < min_travel:
                 continue
-            count += 1
-            vel = travel / (m[-1][0] - m[0][0]) * self.step_dist
-            # Cruise excludes the ramp-in and the final period, where a
+            # Homing moves share the direction of the first one; a
+            # retract goes the other way and does not end in a stall
+            direction = 1 if pn > p0 else -1
+            if homing_dir is None:
+                homing_dir = direction
+            # Cruise excludes the ramp-in and the final period, where the
             # stall collapses sg_result by design
             cruise = sorted([sg for _, pos, sg in m
                              if abs(pos - p0) >= self.settle_steps
                              and abs(pn - pos) >= self.settle_steps])
             final = [sg for _, pos, sg in m
                      if abs(pn - pos) < self.settle_steps]
-            plateau = cruise[len(cruise) // 2]
-            cruise_min = cruise[0]
-            end_min = min(final)
+            moves.append({
+                'vel': abs(pn - p0) / (m[-1][0] - m[0][0]) * self.step_dist,
+                'plateau': cruise[len(cruise) // 2],
+                'cruise_min': cruise[0],
+                'end_min': min(final),
+                'is_home': direction == homing_dir,
+            })
+        return moves
+    def _report_moves(self, moves):
+        if not moves:
+            self.respond_info("No homing move long enough to evaluate"
+                              " was recorded")
+            return
+        if self.use_sg4:
+            thrs = self.fields.get_field(self.sg4_thrs_field)
+            self.respond_info("StallGuard4 trips below sg_result %d"
+                              " (2 x driver_%s)"
+                              % (2 * thrs, self.sg4_thrs_field.upper()))
+        for i, m in enumerate(moves):
             self.respond_info(
-                "Move %d: %.1f mm/s, sg_result plateau %d, cruise minimum"
-                " %d, end %d%s" % (count, vel, plateau, cruise_min, end_min,
-                                  " (stall)" if end_min == 0 else ""))
-            if end_min != 0:
+                "Move %d (%s): %.1f mm/s, sg_result plateau %d, cruise"
+                " minimum %d, end %d" % (
+                    i + 1, "homing" if m['is_home'] else "retract",
+                    m['vel'], m['plateau'], m['cruise_min'], m['end_min']))
+            if not m['is_home']:
                 continue
             # AN-002 2.2: the lowest reading preceding the stall is the
             # safety margin against false stall detection
+            plateau, cruise_min = m['plateau'], m['cruise_min']
             if plateau < 50:
                 self.respond_info(
                     "  Unloaded sg_result is only %d at %.1f mm/s: little"
-                    " headroom, raise driver_SGT or the homing speed"
-                    % (plateau, vel))
+                    " headroom, %s or raise the homing speed" % (
+                        plateau, m['vel'],
+                        "lower driver_%s" % (self.sg4_thrs_field.upper(),)
+                        if self.use_sg4 else "raise driver_SGT"))
             elif cruise_min * 5 < plateau:
                 self.respond_info(
                     "  sg_result dipped to %d%% of the plateau during travel"
@@ -967,16 +1022,38 @@ class TMCStallGuardHelper:
                 self.respond_info(
                     "  Lowest reading before the stall keeps %d%% of the"
                     " plateau" % (100 * cruise_min // plateau,))
-        if not count:
-            self.respond_info("No homing move long enough to evaluate"
-                              " was recorded")
         if self.fields.lookup_register("tcoolthrs", None) is not None:
             if not self.fields.get_field("tcoolthrs"):
                 self.respond_info(
                     "coolstep_threshold is not set: stall detection was"
                     " armed during the whole acceleration ramp. Run"
                     " TARGET=sgt_velocity to set it (AN-002 2.1)")
-
+    def _finish_sgthrs(self, moves):
+        home_moves = [m for m in moves if m['is_home']]
+        if not home_moves:
+            return
+        # AN-002 3.1.1 step 3: take the lowest SG_RESULT before the motor
+        # stalls, divide it by two, and put it into SGTHRS
+        lowest = min([m['cruise_min'] for m in home_moves])
+        thrs = min(lowest // 2, 255)
+        option = "driver_%s" % (self.sg4_thrs_field.upper(),)
+        run_current = self.current_helper.get_current()[0]
+        configfile = self.printer.lookup_object('configfile')
+        configfile.set(self.config_name, option, thrs)
+        self.respond_info(
+            "%s: %d (half of the lowest sg_result %d before the stall,"
+            " plateau %d at %.1f mm/s)\n"
+            "Measured with run_current %.3fA; the value only holds near"
+            " that operating point (AN-002 3.3)" % (
+                option, thrs, lowest, home_moves[0]['plateau'],
+                home_moves[0]['vel'], run_current))
+        if thrs == 0:
+            self.respond_info(
+                "  sg_result never rose above 1 during travel: StallGuard4"
+                " has no signal at this speed, home faster")
+        self.respond_info(
+            "The SAVE_CONFIG command will update the printer config file\n"
+            "with these parameters and restart the printer.")
 
 ######################################################################
 # TMC virtual pins
