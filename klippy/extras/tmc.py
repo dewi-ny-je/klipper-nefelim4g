@@ -589,6 +589,7 @@ class TMCStallGuardHelper:
         self.mcu_tmc = tmc_command_helper.mcu_tmc
         self.config_name = tmc_command_helper.config_name
         self.record_helper = tmc_command_helper.record_helper
+        self.current_helper = tmc_command_helper.current_helper
         self.toolhead = self.printer.lookup_object('toolhead')
         self.respond_info = gcmd.respond_info
         self.target = gcmd.get('TARGET')
@@ -627,6 +628,8 @@ class TMCStallGuardHelper:
         self.is_running = True
         self._timer = None
         self.sgt = 0
+        self.max_sg = 0
+        self._warn_unused_result()
         self.respond_info("Use ABORT_TMC_CALIBRATE to exit")
         gcode = self.printer.lookup_object("gcode")
         try:
@@ -634,6 +637,20 @@ class TMCStallGuardHelper:
                                    desc=self._cmd_abort_help)
         except self.printer.config_error:
             raise gcmd.error("Another calibration in progress")
+    def _warn_unused_result(self):
+        # SGT is only meaningful for the chopper settings it was found
+        # with (AN-002 treats SpreadCycle tuning as a prerequisite)
+        self.respond_info(
+            "Note: driver_SGT is only valid for the current SpreadCycle"
+            " settings, run_current and supply voltage")
+        # On TMC2240 a non-zero driver_SG4_THRS makes sensorless homing
+        # use StallGuard4 (with stealthChop) and ignore driver_SGT
+        if self.fields.lookup_register("sg4_thrs", None) is None:
+            return
+        if self.fields.get_field("sg4_thrs"):
+            self.respond_info(
+                "Warning: driver_SG4_THRS is set - sensorless homing will use"
+                " StallGuard4 and ignore the calibrated driver_SGT")
     _cmd_abort_help = "Abort stallguard calibration"
     def _cmd_abort(self, gcmd):
         self.is_running = False
@@ -669,6 +686,10 @@ class TMCStallGuardHelper:
         self._set_field("en_pwm_mode", 0)
         # Enable stallguard filtering
         self._set_field("sfilt", 1)
+        # AN-002 requires CoolStep off while parameterizing SGT - otherwise
+        # the driver changes the motor current mid-measurement
+        if self.fields.lookup_register("semin", None) is not None:
+            self._set_field("semin", 0)
         if self.target == "sgt":
             self._set_field("sgt", self.sgt)
         # Disable thigh
@@ -703,6 +724,7 @@ class TMCStallGuardHelper:
                 pairs.append((ptime, sps, sg))
         if len(pairs) == 0:
             return eventtime + 1.0
+        self.max_sg = max(self.max_sg, max([sg for _, _, sg in pairs]))
         if self.target == "sgt":
             return self._sgt_calibration_event(eventtime, pairs)
         return self._sgt_velocity_event(eventtime, pairs)
@@ -755,10 +777,20 @@ class TMCStallGuardHelper:
         # Finish
         self.respond_info("Avg sg_result: %.1f" % (avg_result))
         self.sgt -= 1
+        step_dist = self.mcu_stepper.get_step_dist()
+        avg_vel = sum([sps for _, sps, _ in W]) / len(W) * step_dist
+        run_current = self.current_helper.get_current()[0]
         configfile = self.printer.lookup_object('configfile')
         configfile.set(self.config_name, 'driver_SGT',
                        self.sgt)
+        # Homing uses whatever driver_SFILT is configured, so record the
+        # filter setting that sgt was actually measured with
+        if self.fields.lookup_register("sfilt", None) is not None:
+            configfile.set(self.config_name, 'driver_SFILT', 1)
         self.respond_info("driver_SGT: %d" % (self.sgt))
+        self.respond_info(
+            "Measured at run_current %.3fA and %.1f mm/s - driver_SGT holds"
+            " only near that operating point" % (run_current, avg_vel))
         self.respond_info(
             "The SAVE_CONFIG command will update the printer config file\n"
             "with these parameters and restart the printer.")
@@ -777,7 +809,25 @@ class TMCStallGuardHelper:
         min_vel = min_sps * step_dist
         self.respond_info("Stall detection velocity must be above %.1f mm/s" % (
                           min_vel))
-        self.respond_info("Min sg_result: %.1f" % (min_sg))
+        self.respond_info("Min sg_result: %d (peak seen: %d)" % (
+                          min_sg, self.max_sg))
+        if self.max_sg:
+            self.respond_info(
+                "Load reserve there is %.0f%% of the unloaded sg_result -"
+                " a resonance or a tight spot may read as a stall" % (
+                    100. * min_sg / self.max_sg,))
+        # AN-002: the stall velocity gate must sit close to the velocity
+        # sg_result was validated at.  Without a coolstep_threshold,
+        # TMCVirtualPinHelper arms StallGuard for the whole homing
+        # acceleration ramp, where back-EMF is still too low to measure.
+        if self.fields.lookup_register("tcoolthrs", None) is not None:
+            configfile = self.printer.lookup_object('configfile')
+            configfile.set(self.config_name, 'coolstep_threshold',
+                           "%.1f" % (min_vel,))
+            self.respond_info("coolstep_threshold: %.1f mm/s" % (min_vel,))
+            self.respond_info(
+                "The SAVE_CONFIG command will update the printer config file\n"
+                "with these parameters and restart the printer.")
         self._cmd_abort(None)
         return self.reactor.NEVER
 
