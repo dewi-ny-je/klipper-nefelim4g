@@ -1642,6 +1642,33 @@ When used on a driver which has the `globalscaler` field (tmc5160 and tmc2240),
 if StealthChop2 is used, the stepper must be held at standstill for >130ms so
 that the driver executes the AT#1 calibration.
 
+#### TMC_CALIBRATE
+`TMC_CALIBRATE STEPPER=<name> TARGET=[sgt|sgt_velocity]`: This command
+calibrates StallGuard2 parameters used for sensorless homing. It is only
+available on drivers that implement a StallGuard2 threshold (`driver_SGT`)
+and can report `sg_result` - that is tmc2130, tmc2240 and tmc5160.
+
+During calibration the driver is temporarily switched to SpreadCycle,
+StallGuard filtering is enabled, and CoolStep and `driver_THIGH` are
+disabled; the previous register values are restored when the calibration
+ends. Use `ABORT_TMC_CALIBRATE` to stop early.
+
+With `TARGET=sgt` the axis must be moved by hand (or with `FORCE_MOVE`) at
+a steady 2-10 RPM. The command raises `driver_SGT` until `sg_result` stops
+reading zero, then stores the last value that still read zero along with
+the `driver_SFILT` setting it was measured with. The reported run current
+and velocity are the operating point the result is valid for - a value
+found at one current, supply voltage or velocity does not carry over to
+another.
+
+With `TARGET=sgt_velocity` the axis is moved while slowly increasing
+velocity. The command reports the lowest velocity at which `sg_result` is
+still usable, the load reserve at that point, and stores the velocity as
+`coolstep_threshold` so that sensorless homing does not arm StallGuard
+during the acceleration ramp, where back-EMF is too low to measure.
+
+Both targets require a `SAVE_CONFIG` to make the results permanent.
+
 #### SET_TMC_FIELD
 `SET_TMC_FIELD STEPPER=<name> FIELD=<field> VALUE=<value> VELOCITY=<value>`:
 This will alter the value of the specified register field of the TMC driver.
