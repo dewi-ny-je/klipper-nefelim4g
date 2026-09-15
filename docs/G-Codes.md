@@ -1643,13 +1643,15 @@ if StealthChop2 is used, the stepper must be held at standstill for >130ms so
 that the driver executes the AT#1 calibration.
 
 #### TMC_CALIBRATE
-`TMC_CALIBRATE STEPPER=<name> TARGET=[sgt|sgt_velocity|verify]
-[MIN_SG=<value>] [AXIS=<axis>]`: Calibrates the StallGuard2 parameters
-used for sensorless homing. Available on drivers with a `driver_SGT`
-field and a readable `sg_result` (tmc2130, tmc2240, tmc5160). The
-procedure follows Trinamic application note AN-002; every result is
-only valid for the run current, supply voltage, chopper settings and
-velocity it was measured at, and a `SAVE_CONFIG` is needed to keep it.
+`TMC_CALIBRATE STEPPER=<name> TARGET=[sgt|sgthrs|sgt_velocity|verify]
+[MIN_SG=<value>] [AXIS=<axis>]`: Calibrates the StallGuard parameters
+used for sensorless homing. StallGuard2 targets (`sgt`) are available
+on tmc2130, tmc5160 and tmc2240; StallGuard4 targets (`sgthrs`) on
+tmc2209 and on tmc2240 when `driver_SG4_THRS` is set, matching what
+sensorless homing uses on that driver. The procedure follows Trinamic
+application note AN-002; every result is only valid for the run
+current, supply voltage, chopper settings and velocity it was measured
+at, and a `SAVE_CONFIG` is needed to keep it.
 
 `TARGET=sgt` finds the `driver_SGT` boundary at low speed. Move the
 axis by hand or with `FORCE_MOVE` at a steady 2-10 motor RPM (the
@@ -1662,6 +1664,14 @@ within one electrical period of a register change are ignored. The
 current `driver_SFILT` setting is kept during the search so the result
 matches the conditions homing runs under. Use `ABORT` to stop.
 
+`TARGET=sgthrs` (StallGuard4) records `sg_result` through a real
+sensorless homing move (`G28` on the axis the stepper belongs to, or
+`AXIS=`) and stores half of the lowest reading seen during travel
+before the stall as `driver_SGTHRS` (or `driver_SG4_THRS`), which is
+the AN-002 procedure for StallGuard4. The current threshold must
+already produce a completed home; Klipper's documentation suggests
+starting from a sensitive value and lowering it until the axis homes.
+
 `TARGET=sgt_velocity` finds the lowest speed at which StallGuard is
 usable. Move the axis while slowly increasing the velocity; the command
 reports the speed from which `sg_result` stays at or above `MIN_SG`
@@ -1672,9 +1682,10 @@ homing speed above the reported value. Use `ABORT` to stop.
 
 `TARGET=verify` records `sg_result` through a real sensorless homing
 move (`G28` on the axis the stepper belongs to, or `AXIS=`) and
-reports, for each move, the velocity, the unloaded `sg_result` plateau,
-the lowest reading during travel, and the value at the end of the
-move (zero for a stall). The lowest reading before the stall is the
+reports, for each homing and retract move, the velocity, the unloaded
+`sg_result` plateau, the lowest reading during travel, and the value
+at the end of the move (zero for a StallGuard2 stall; below twice the
+threshold for StallGuard4). The lowest reading before the stall is the
 margin against a false stall detection; a warning is given when it
 is small or when the plateau itself is low.
 
