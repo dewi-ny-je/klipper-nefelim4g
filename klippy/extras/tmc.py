@@ -1051,6 +1051,12 @@ class TMCStallGuardHelper:
             self.respond_info(
                 "  sg_result never rose above 1 during travel: StallGuard4"
                 " has no signal at this speed, home faster")
+        elif lowest // 2 > 255:
+            # TMC2240 SG4_RESULT is 10 bit while the threshold is 8 bit
+            self.respond_info(
+                "  Clamped to the field maximum 255 (trips below 510);"
+                " a higher homing speed or run current would give the"
+                " comparator more range")
         self.respond_info(
             "The SAVE_CONFIG command will update the printer config file\n"
             "with these parameters and restart the printer.")
